@@ -1,0 +1,149 @@
+/*step1:筛选客户*/
+truncate naml.temp_bh_cust;--回退
+insert into naml.temp_bh_cust(
+  cif_no,   --客户号
+  rece_pay_flag, --收付标识
+  su_cny,  --折人民币汇总
+  su_usd --折美元汇总
+)
+select
+  cif_no,   --客户号
+  ece_pay_flag, --收付标识
+  u_cny,  --折人民币汇总
+  u_usd --折美元汇总
+from(
+select 
+  cif_no,  客户号
+  rece_pay_flag, --收付标识
+  sum(tx_cny_amt) as su_cny, --折人民币汇总
+  sum(tx_usd_amt) as su_usd --折美元汇总
+from 
+	naml.tb_cust_tx
+where ct_ind ='1' --现转标识：1：现金 2：转账
+and 
+	tx_date = TO_DATE('时间传参','yyyy-mm-dd')
+group by cif_no,rece_pay_flag
+)t
+	where t.su_cny >=50000
+OR
+	t.su_usd >=10000;
+ 
+
+/*step2:筛选交易*/
+truncate  naml.temp_bh_tx;
+insert into naml.temp_bh_tx(
+	            trace_no,--业务流水号
+                cif_no,--客户号
+                cif_name,--客户名称
+                tx_date, --交易日期
+				model_type,--模型规则
+				su_amt,--涉及金额
+				cn_tra--涉及笔数
+						 )
+
+SELECT
+              t1.trace_no,--业务流水号
+              t2.cif_no,--客户号
+              t1.cif_name,--客户名称
+              t1.tx_date, --交易日期
+              '0501' as model_type,--模型规则
+              sum(t1.tx_amt) over (PARTITION by t1.cif_no) as su_amt,--涉及金额
+              count(t1.trace_no) over (PARTITION by t1.cif_no) as cn_tra--涉及笔数
+
+FROM
+naml.tb_cust_tx t1
+inner join  
+naml.temp_bh_cust t2 --已经命中的客户，与宽表内关联返回已经命中的客户对应的交易流水号
+on t1.cif_no=t2.cif_no
+and t1.rece_pay_flag=t2.rece_pay_flag  --不能光卡客户编号，返回的是所有的交易流水，包含收和付
+--比如：只有收款每日合计超5万，但是不卡收付标识的话，也会把带付款标识的数据返回，不是我们想要的结果
+where t1.tx_date = TO_DATE('时间传参','yyyy-mm-dd')
+and t1.ct_ind ='1' --现转标识，模型要现金
+
+
+
+/*step3:插入大额案例客户表*/
+
+delete from tb_bh_case_cust where tx_date = to_date('时间参数','yyyy-mm-dd') and modell_type ='0501'  --所有的规则都放这一张表中，如果不加限制会把其他规则得都删掉，不合理
+
+select 
+   case_no,            --案例编号：28位包括大额标识、日期、客户号、模型编号
+   case_dt,            --案例生成日期
+   cif_no,             --客户号
+   cif_name,           --客户名称
+   input_flag,         --输入类型：1.模型产生 2.增录产生
+   modell_type,        --模型规则：0501，0502，0503，0504
+   su_amt,             --涉及金额
+   cn_tra,             --涉及笔数
+   tx_date,            --交易日期
+   is_rptf             --是否生成报告
+from (select 
+    'BH'||to_char(sysdate,'yyyymmdd')||cif_no||modell_type as case_no,--案例编号：28位包括大额标识、日期、客户号、模型编号
+    SYSDATE as case_dt,       --案例生成日期
+    cif_no,                   --客户号
+    cif_name,                 --客户名称
+    '1' as input_flag,        --输入类型：1.模型产生 2.增录产生
+    modell_type,              --模型规则：0501，0502，0503，0504
+    su_amt,                   --涉及金额
+    cn_tra,                   --涉及笔数
+    tx_date,                  --交易日期
+    '1' as is_rptf            --是否生成报告
+from 
+	naml.temp_bh_tx --大额交易临时表 
+	group by cif_no,cif_name,modell_type, su_amt,cn_tra,tx_date  ;
+	/*去重得原因，交易临时表中是按业务流水号做主键，这样一个客户可能包含多条流水，
+	在这张表里同一个案例编号会有多条数据，所以要去重，一个客户对应一个案例*/
+	
+/*step4:插入大额案例交易表*/
+
+delete from tb_bh_case_cust where tx_date = to_date('时间参数','yyyy-mm-dd') and modell_type ='0501'  
+--所有的规则都放这一张表中，如果不加限制会把其他规则得都删掉，不合理
+insert into naml.tb_bh_case_cust 
+select 
+   case_no,                 --案例编号：28位包括大额标识、日期、客户号、模型编号
+   case_dt,					--案例生成日期
+   trace_no,			     --流水号
+   cif_no,                   --客户号
+   cif_name,                 --客户名称
+   ac_id,                    --账户号
+   rece_pay_flag,            --收付标识
+   tx_br_no,                 --交易机构号
+   tx_amt,                   --交易金额
+   tx_cny_amt,               --折人民币金额
+   tx_usd_amt,               --折美元金额
+   tx_time,                  --交易时间
+   local_flag,               --是否本地居民：1.是 2：否
+   cb_flag,                  --跨境标识：1.是 2.否
+   input_flag,               --输入类型：1.模型产生 2.增录产生
+   modell_type,              --模型规则：0501，0502，0503，0504
+   tx_date,                  --交易日期
+   is_rptf                   --是否生成报告,写死
+   
+from (select 
+    'BH'||to_char(sysdate,'yyyymmdd')||t1.cif_no||t1.modell_type as case_no,--案例编号：28位包括大额标识、日期、客户号、模型编号
+    SYSDATE as case_dt,          --案例生成日期  
+	t1.trace_no,			     --流水号
+	t1.cif_no,                   --客户号
+	t1.cif_name,                 --客户名称
+    t2.ac_id,                    --账户号
+	t2.rece_pay_flag,            --收付标识
+	t2.tx_br_no,                 --交易机构号
+	t2.tx_amt,                   --交易金额
+	t2.tx_cny_amt,               --折人民币金额
+	t2.tx_usd_amt,               --折美元金额
+	t2.tx_time,                  --交易时间
+	t2.local_flag,               --是否本地居民：1.是 2：否
+	t2.cb_flag,                  --跨境标识：1.是 2.否
+	'1' as input_flag,           --输入类型：1.模型产生 2.增录产生
+    t1.modell_type,              --模型规则：0501，0502，0503，0504
+    t2.tx_date,                  --交易日期
+    '1' as is_rptf               --是否生成报告,写死
+from 
+	naml.temp_bh_tx t1--大额交易临时表 
+	inner join naml.tb_cust_tx t2 --有些字段临时表取不到，所以关联宽表
+	on t1.trace_no=t2.trace_no
+	where t2.tx_date = to_date('时间参数','yyyy-mm-dd');
+	
+
+
+
